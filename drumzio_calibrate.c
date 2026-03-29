@@ -86,6 +86,10 @@ bool read_line_uart(char *buf, size_t buflen, uint32_t timeout_ms) {
 void handle_incoming_config(const char *line, drum_trigger_cfg_t *current_cfg) {
     char err[128];
     drum_trigger_cfg_t newcfg;
+
+    printf("IN_RAW:%s\n", line);
+    fflush(stdout);
+
     if (!parse_cfg_from_json_line(line, &newcfg, err, sizeof(err))) {
         printf("ERR %s\n", err);
         fflush(stdout);
@@ -99,7 +103,6 @@ void handle_incoming_config(const char *line, drum_trigger_cfg_t *current_cfg) {
 }
 
 
-
 int main() {
 
 	// variables
@@ -110,6 +113,7 @@ int main() {
 	drum_trigger_state_t st;
 	drum_trigger_init(&st);
     char linebuf[512];
+    int32_t signal;
 
 	// 5kz sampling
 	drum_trigger_cfg_t cfg = {
@@ -157,9 +161,12 @@ int main() {
 	while (1) {
 		// read ADC
 		adc_select_input(0);
-		rim = adc_read(); // 0..4095
+		signal = (int32_t) (adc_read() - 2048); // idle adc_read = 2048; on recentre à 0
+        rim = (uint16_t) abs (signal);
+
 		adc_select_input(1);
-		head = adc_read();
+		signal = (int32_t) (adc_read() - 2048); // idle adc_read = 2048; on recentre à 0
+        head = (uint16_t) abs (signal);
 
 		// determine if drum was hit
 		drum_hit_t hit = drum_trigger_update (&st, &cfg, head, rim, to_ms_since_boot(get_absolute_time()));
