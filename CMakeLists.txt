@@ -35,19 +35,26 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(drumzio_calibrate drumzio_calibrate.c drum_trigger.c )
+add_executable(drumzio_calibrate
+    drumzio_calibrate.c
+    drum_trigger.c
+)
+
 
 pico_set_program_name(drumzio_calibrate "drumzio_calibrate")
 pico_set_program_version(drumzio_calibrate "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(drumzio_calibrate 0)
-pico_enable_stdio_usb(drumzio_calibrate 1)
+#pico_enable_stdio_uart(drumzio_calibrate 0)
+#pico_enable_stdio_usb(drumzio_calibrate 1)
 
 # Add the standard library to the build
 target_link_libraries(drumzio_calibrate
-        pico_stdlib
-        hardware_adc)
+    pico_stdlib
+    hardware_adc
+    pico_stdio_usb  # For USB CDC
+)
+
 
 # Add the standard include files to the build
 target_include_directories(drumzio_calibrate PRIVATE
