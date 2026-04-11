@@ -28,6 +28,8 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def send_json(ser, data):
+    if hasattr(ser, 'reset_input_buffer'):
+        ser.reset_input_buffer()
     msg = json.dumps(data) + '\n'
     ser.write(msg.encode('utf-8'))
     ser.flush()
@@ -80,6 +82,28 @@ def collect_hits(ser, count, timeout_per_hit=3.0, show_debug=False, filter_kind=
         time.sleep(0.01)
     return hits, all_hits
 
+def estimate_retrigger_ms(hits, min_ms=15, max_ms=80, percentile=20):
+    if len(hits) < 2:
+        return 30
+    times = np.array([h['t_ms'] for h in hits], dtype=float)
+    diffs = np.diff(times)
+    if len(diffs) == 0:
+        return 30
+    value = float(np.percentile(diffs, percentile))
+    return int(clamp(value, min_ms, max_ms))
+
+
+def estimate_release_ms(hits, min_ms=15, max_ms=60, percentile=10):
+    if len(hits) < 2:
+        return 30
+    times = np.array(sorted(h['t_ms'] for h in hits), dtype=float)
+    diffs = np.diff(times)
+    if len(diffs) == 0:
+        return 30
+    value = float(np.percentile(diffs, percentile))
+    return int(clamp(value, min_ms, max_ms))
+
+
 def estimate_head_cfg(hits):
     if not hits:
         return {}
@@ -89,12 +113,14 @@ def estimate_head_cfg(hits):
     arr = np.array(peaks, dtype=float)
     noise = percentile_np(arr, 5) or 0
     std = float(np.std(arr)) or 1
-    th_low = int(clamp(noise + 4 * std, 1, 4095))
+    max_peak = int(np.max(arr))
+    min_peak = int(np.min(arr))
+    th_low = int(clamp(noise + 3 * std, 1, min_peak - 1))
+    th_low = clamp(th_low, 1, max_peak - 1)
     median = int(np.median(arr))
     weak_p = int(percentile_np(arr, 20) or median)
-    th_high = int(clamp(max(th_low + 60, weak_p), 1, 4095))
-    # Retrigger from IOIs (simplified)
-    retrigger = 30  # Default
+    th_high = int(clamp(max(th_low + 40, weak_p), 1, max_peak))
+    retrigger = estimate_retrigger_ms(hits, min_ms=15, max_ms=70)
     return {
         'th_high_head': th_high,
         'th_low_head': th_low,
@@ -110,11 +136,20 @@ def estimate_rim_cfg(hits):
     arr = np.array(peaks, dtype=float)
     noise = percentile_np(arr, 5) or 0
     std = float(np.std(arr)) or 1
-    th_low = int(clamp(noise + 4 * std, 1, 4095))
+    max_peak = int(np.max(arr))
+    min_peak = int(np.min(arr))
+    max_safe_peak = int(np.percentile(arr[arr < 2048] if np.any(arr < 2048) else arr, 95))
+    max_safe_peak = max(max_safe_peak, min_peak + 20)
+    if max_peak >= 2048:
+        max_safe_peak = min(max_safe_peak, 2047 - 20)
+    max_safe_peak = min(max_safe_peak, max_peak)
+
+    th_low = int(clamp(noise + 3 * std, 1, min_peak - 1))
+    th_low = clamp(th_low, 1, max_safe_peak - 20)
     median = int(np.median(arr))
     weak_p = int(percentile_np(arr, 20) or median)
-    th_high = int(clamp(max(th_low + 60, weak_p), 1, 4095))
-    retrigger = 30
+    th_high = int(clamp(max(th_low + 40, weak_p), 1, max_safe_peak))
+    retrigger = estimate_retrigger_ms(hits, min_ms=15, max_ms=70)
     return {
         'th_high_rim': th_high,
         'th_low_rim': th_low,
@@ -125,9 +160,15 @@ def wait_for_config_ack(ser, timeout=5):
     """Wait for config_updated ack from MCU with timeout."""
     start = time.time()
     while time.time() - start < timeout:
-        data = read_json_line(ser, 0.5)
-        if data and data.get('status') == 'config_updated':
-            return True
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if data.get('status') == 'config_updated':
+                return True
+        except json.JSONDecodeError:
+            pass
     print("  Warning: No config ack received (timeout)")
     return False
 
@@ -145,29 +186,16 @@ def estimate_both_cfg(hits, head_median, rim_median):
     if not ratios:
         return {}
     ratio = float(np.median(ratios))
-    both_ratio_q15 = int((ratio * 1.2) * 32768)  # Slightly relaxed
-    min_sec = int(max(np.percentile(secondaries, 30) if secondaries else 200,
-                      0.25 * min(head_median, rim_median)))
-    return {
-        'both_ratio_q15': both_ratio_q15,
-        'min_secondary_for_both': min_sec
-    }
-    if not hits:
-        return {}
-    ratios = []
-    secondaries = []
-    for h in hits:
-        mx = max(h['peak_head'], h['peak_rim'])
-        mn = min(h['peak_head'], h['peak_rim'])
-        if mn > 0:
-            ratios.append(mx / mn)
-            secondaries.append(mn)
-    if not ratios:
-        return {}
-    ratio = float(np.median(ratios))
-    both_ratio_q15 = int((ratio * 1.2) * 32768)  # Slightly relaxed
-    min_sec = int(max(np.percentile(secondaries, 30) if secondaries else 200,
-                      0.25 * min(head_median, rim_median)))
+    ratio = max(1.2, min(ratio * 1.15, 1.5))
+    both_ratio_q15 = int(ratio * 32768)
+
+    low_secondary = int(np.percentile(secondaries, 20) * 0.85)
+    safe_floor = int(max(200,
+                         0.25 * max(head_median, rim_median),
+                         0.35 * min(head_median, rim_median)))
+    min_sec = int(min(low_secondary, 0.75 * min(head_median, rim_median)))
+    min_sec = int(max(min_sec, safe_floor))
+
     return {
         'both_ratio_q15': both_ratio_q15,
         'min_secondary_for_both': min_sec
@@ -186,7 +214,6 @@ def main():
     while True:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
         if line:
-            print(f"Raw: {line}")
             try:
                 data = json.loads(line)
                 if data.get('status') == 'ready':
@@ -205,7 +232,7 @@ def main():
 
     print("\n=== PHASE 1: HEAD ===")
     input("Hit the HEAD several times (strong and weak). Press Enter to start collecting 20 hits.")
-    hits_head, _ = collect_hits(ser, 20)
+    hits_head, _ = collect_hits(ser, 20, filter_kind='HEAD')
     head_cfg = estimate_head_cfg(hits_head)
     cfg.update(head_cfg)
     send_json(ser, cfg)
@@ -215,11 +242,14 @@ def main():
     # Phase 2: RIM
     print("\n=== PHASE 2: RIM ===")
     input("Hit the RIM several times (strong and weak). Press Enter to start collecting 20 hits.")
-    hits_rim, _ = collect_hits(ser, 20)
+    hits_rim, _ = collect_hits(ser, 20, filter_kind='RIM')
     rim_cfg = estimate_rim_cfg(hits_rim)
     cfg.update(rim_cfg)
+    combined_hits = hits_head + hits_rim
+    cfg['release_ms'] = estimate_release_ms(combined_hits, min_ms=15, max_ms=60)
     send_json(ser, cfg)
     print("Sent updated config for RIM.")
+    print(f"  release_ms set to {cfg['release_ms']} based on combined hit timing.")
     wait_for_config_ack(ser)
 
     # Phase 3: BOTH
@@ -236,9 +266,9 @@ def main():
     wait_for_config_ack(ser)
     
     input("Play rimshots (hit both head and rim simultaneously). Press Enter to start collecting 15 hits.")
-    print("Collecting rimshots with debug output enabled...")
+    print("Collecting rimshots...")
     print("Note: Only hits classified as BOTH will be counted. Accidental single hits will be skipped.")
-    hits_both, all_hits_both = collect_hits(ser, 15, show_debug=True, filter_kind='BOTH')
+    hits_both, all_hits_both = collect_hits(ser, 15, show_debug=False, filter_kind='BOTH')
     
     if not hits_both:
         print("\nNo BOTH hits detected. Summary of all hits received:")
