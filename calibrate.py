@@ -104,6 +104,17 @@ def estimate_release_ms(hits, min_ms=15, max_ms=60, percentile=10):
     return int(clamp(value, min_ms, max_ms))
 
 
+def estimate_fast_retrigger_ms(hits, min_ms=10, max_ms=50, percentile=10):
+    if len(hits) < 2:
+        return 30
+    times = np.array([h['t_ms'] for h in hits], dtype=float)
+    diffs = np.diff(times)
+    if len(diffs) == 0:
+        return 30
+    value = float(np.percentile(diffs, percentile))
+    return int(clamp(value, min_ms, max_ms))
+
+
 def estimate_head_cfg(hits):
     if not hits:
         return {}
@@ -252,8 +263,47 @@ def main():
     print(f"  release_ms set to {cfg['release_ms']} based on combined hit timing.")
     wait_for_config_ack(ser)
 
-    # Phase 3: BOTH
-    print("\n=== PHASE 3: BOTH (Rimshots) ===")
+    # Phase 3: FAST HEAD
+    print("\n=== PHASE 3: FAST HEAD ===")
+    input("Hit the HEAD as fast as you can. Press Enter to start collecting 15 hits.")
+    hits_fast_head, _ = collect_hits(ser, 15, filter_kind='HEAD')
+    if hits_fast_head:
+        fast_head_retrigger = estimate_fast_retrigger_ms(hits_fast_head)
+        cfg['retrigger_head_ms'] = fast_head_retrigger
+        send_json(ser, cfg)
+        print(f"Sent updated config for fast HEAD. retrigger_head_ms={fast_head_retrigger}")
+        wait_for_config_ack(ser)
+    else:
+        print("No fast HEAD hits collected; keeping previous retrigger_head_ms.")
+
+    # Phase 4: FAST RIM
+    print("\n=== PHASE 4: FAST RIM ===")
+    input("Hit the RIM as fast as you can. Press Enter to start collecting 15 hits.")
+    hits_fast_rim, _ = collect_hits(ser, 15, filter_kind='RIM')
+    if hits_fast_rim:
+        fast_rim_retrigger = estimate_fast_retrigger_ms(hits_fast_rim)
+        cfg['retrigger_rim_ms'] = fast_rim_retrigger
+        send_json(ser, cfg)
+        print(f"Sent updated config for fast RIM. retrigger_rim_ms={fast_rim_retrigger}")
+        wait_for_config_ack(ser)
+    else:
+        print("No fast RIM hits collected; keeping previous retrigger_rim_ms.")
+
+    # Phase 5: FAST ALTERNATING HEAD/RIM
+    print("\n=== PHASE 5: FAST ALTERNATING HEAD/RIM ===")
+    input("Play alternating HEAD and RIM strikes as fast as you can. Press Enter to start collecting 25 hits.")
+    hits_fast_alt, _ = collect_hits(ser, 25, timeout_per_hit=2.0)
+    if hits_fast_alt:
+        fast_release = estimate_release_ms(hits_fast_alt, min_ms=10, max_ms=50, percentile=10)
+        cfg['release_ms'] = fast_release
+        send_json(ser, cfg)
+        print(f"Sent updated config for fast alternation. release_ms={fast_release}")
+        wait_for_config_ack(ser)
+    else:
+        print("No fast alternating hits collected; keeping previous release_ms.")
+
+    # Phase 6: BOTH
+    print("\n=== PHASE 6: BOTH (Rimshots) ===")
     print("Relaxing thresholds to detect rimshots...")
     # Relax thresholds by 30% to make detection easier for rimshots
     relaxed_cfg = cfg.copy()
